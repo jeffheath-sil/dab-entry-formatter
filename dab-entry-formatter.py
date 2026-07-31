@@ -1,0 +1,1137 @@
+# dab-entry-formatter.py -- entry point for the DAB Entry Formatter's "Tune" stage (see DESIGN.md).
+#
+# Unlike prototype/build_entry_tuner.py, this doesn't embed one project's data
+# into the page at build time. It emits a single, reusable dab-entry-formatter.html
+# that loads a DAB project's appDef/xhtml itself, in the browser, via Chrome's File
+# System Access API -- reads the project's files AND writes the tuned styles
+# straight into the LIVE appDef, no server process and no per-project rebuild.
+#
+# This deliberately departs from CLAUDE.md's "never touch the live appDef"
+# rule, at the project owner's explicit request ("I want to live dangerously").
+# The one safety net kept: the first Save for a project backs up the appDef's
+# pre-tuning content to "<name> (backup before dab-entry-formatter).appDef" and
+# never touches that backup again, so there's always a way back to where you
+# started even though every Save after that overwrites the live file directly.
+#
+# Run once: `python dab-entry-formatter.py` writes dab-entry-formatter.html next
+# to this script. Open that file in Chrome or Edge and click "Choose DAB
+# project folder..." -- it
+# expects the folder that directly contains <name>.appDef, next to a
+# <name>_data/lexicon/ folder holding the FLEx *.xhtml export(s) (confirmed
+# against real project folders under ...\App Builder\Dictionary Apps\App
+# Projects\; a project can have more than one exported dictionary there, e.g. a
+# reversal index alongside the main one -- if so, the tool asks which to load).
+#
+# Firefox/Safari lack the File System Access API, so the page still loads and
+# tunes there too (via a plain folder <input>), but can only offer the manual
+# "Copy .appDef styles" clipboard button instead of one-click Save -- the
+# Save button is disabled whenever the project wasn't opened through the API.
+#
+# Scope still matches CLAUDE.md: FLEx XHTML exports only (a LIFT-based project
+# is detected and rejected with a clear message, not a crash). FIELD_DEFS in
+# the script below is still the fixed selector grouping derived from the
+# Baraïn project (DESIGN.md stage 2's general role-assignment isn't built) --
+# pointing this at a different project only styles whatever of those classes
+# actually exist in its export; anything else is silently absent from the
+# generated rules, and any selector that doesn't validate against that
+# project's own Imported Styles list is refused rather than written, exactly
+# as before.
+
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+OUT = SCRIPT_DIR / "dab-entry-formatter.html"
+
+
+def main():
+    with open(OUT, "w", encoding="utf-8") as f:
+        f.write(TEMPLATE)
+    print(f"wrote {OUT}  ({len(TEMPLATE):,} bytes)")
+
+
+TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>DAB Entry Tuner</title>
+<style>
+ :root{color-scheme:light dark}
+ body{margin:0;background:#1c1e22;color:#e8e8e8;font:14px/1.4 "Segoe UI",sans-serif}
+ .hidden{display:none !important}
+ header{padding:10px 16px;border-bottom:1px solid #3a3d42;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+ header h1{margin:0;font-size:16px;font-weight:600;white-space:nowrap}
+ .meta{color:#8a8f98;font-size:12px}
+ select,input[type=text],input[type=number],button{font:13px/1.3 "Segoe UI",sans-serif;
+   background:#2a2d33;color:#e8e8e8;border:1px solid #454952;border-radius:4px;padding:4px 7px}
+ input[type=number]{width:52px}
+ input[type=checkbox]{transform:scale(1.1)}
+ button{cursor:pointer}
+ button:hover{background:#34383f}
+ button:disabled{opacity:.4;cursor:default}
+ button:disabled:hover{background:#2a2d33}
+ #entrySelect{min-width:200px}
+ #findBox{width:140px}
+ .panel{margin:14px 16px;padding:14px 16px;border:1px solid #3a3d42;border-radius:6px;background:#202226;max-width:640px}
+ .panel p{margin:0 0 10px;color:#c7cad0}
+ .panel p:last-child{margin-bottom:0}
+ .panel code{font-family:Consolas,monospace;color:#8fd0ff}
+ #entryBar{display:flex;gap:14px;align-items:center;padding:8px 16px;border-bottom:1px solid #3a3d42;flex-wrap:wrap}
+ #globalsBar{display:flex;gap:16px;align-items:center;padding:8px 16px;border-bottom:1px solid #3a3d42;
+   flex-wrap:wrap;background:#202226}
+ .g{display:flex;align-items:center;gap:6px;font-size:12.5px;color:#c7cad0;white-space:nowrap}
+ .g input{width:56px}
+ main{display:flex;gap:0;padding:14px;align-items:flex-start}
+ #previewPane{flex:0 0 auto;width:460px;position:sticky;top:14px}
+ #previewPane h2, #fieldsPane h2, #rulesPane h2{margin:0 0 8px;font-size:13px;color:#c7cad0;
+   font-weight:600;text-transform:uppercase;letter-spacing:.03em}
+ iframe{width:100%;box-sizing:border-box;height:calc(100vh - 220px);border:1px solid #454952;border-radius:4px;background:#f2f0ec}
+ #dragDivider{flex:0 0 14px;align-self:stretch;cursor:col-resize;position:relative}
+ #dragDivider::after{content:"";position:absolute;left:6px;top:0;bottom:0;width:2px;background:#3a3d42}
+ #dragDivider:hover::after, #dragDivider.dragging::after{background:#5fa8ff}
+ #fieldsPane{flex:1;min-width:400px}
+ table{border-collapse:collapse;width:100%;font-size:12.5px}
+ th,td{text-align:left;padding:5px 7px;border-bottom:1px solid #33363c;vertical-align:middle}
+ th{color:#9aa0aa;font-weight:600}
+ td.fieldname{color:#e8e8e8;white-space:nowrap}
+ td.ctl{white-space:nowrap}
+ .hint{color:#8a8f98;font-size:11px;margin-left:4px}
+ .dash{color:#5a5e66}
+ tr.disabledrow td.ctl input{opacity:.4}
+ .rowreset{background:none;border:none;color:#8fd0ff;padding:2px 4px;font-size:13px}
+ .rowreset:hover{background:#34383f;border-radius:4px}
+ #rulesPane{margin-top:16px}
+ td.sel{font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+ td.src{color:#9aa0aa}
+ td.decl{font-family:Consolas,monospace;color:#c7cad0;white-space:pre-wrap;word-break:break-word}
+ .ok{color:#5fd17e}
+ .bad{color:#e0a83e}
+ tr.badrow{background:#332c1c}
+ #banner{margin:0 0 14px;padding:10px 12px;border-radius:4px;background:#332c1c;
+   border:1px solid #6b5a2c;color:#f0d9a0;font-size:13px;display:none}
+ #banner b{color:#ffd980}
+ #banner ul{margin:6px 0 0;padding-left:18px}
+ tr.rowmatch{background:#1f3a52}
+ tr.rowdim{opacity:.35}
+ #tableHint{font-size:12px;color:#8a8f98;margin:0 0 8px}
+ #tableHint a{color:#8fd0ff;cursor:pointer}
+</style></head><body>
+<header>
+  <h1>DAB Entry Tuner</h1>
+  <button id="chooseFolderBtn">Choose DAB project folder…</button>
+  <input type="file" id="folderInputFallback" webkitdirectory style="display:none">
+  <span id="projectMeta" class="meta"></span>
+</header>
+<div id="loaderMsg" class="panel">
+  <p>Choose the DAB project folder to tune — the one that directly contains the project's
+    <code>.appDef</code> file, e.g.
+    <code>…\Documents\App Builder\Dictionary Apps\App Projects\&lt;Project Name&gt;</code>.</p>
+  <p>FLEx XHTML exports only (a LIFT-based project will be reported, not crashed on).</p>
+  <p id="loaderStatus" class="hint"></p>
+</div>
+<div id="lexiconPicker" class="panel hidden">
+  <p>More than one exported dictionary was found in this project's <code>lexicon</code> folder
+    (e.g. a reversal index alongside the main dictionary). Which one do you want to tune?</p>
+  <select id="lexiconSelect"></select>
+  <button id="lexiconChooseBtn">Load</button>
+</div>
+<div id="workspace" class="hidden">
+  <div id="entryBar">
+    <select id="entrySelect"></select>
+    <button id="prevBtn" title="Previous entry">&#9664;</button>
+    <button id="nextBtn" title="Next entry">&#9654;</button>
+    <input id="findBox" type="text" placeholder="Find headword…">
+    <span class="meta" id="countsMeta"></span>
+  </div>
+  <div id="globalsBar">
+    <span class="g">step <input id="g_step" type="number" step="0.1" min="0"> em</span>
+    <span class="g">line-height <input id="g_lineHeight" type="number" step="0.05" min="1"></span>
+    <span class="g">edge padding <input id="g_edgePadding" type="number" step="0.1" min="0"> em</span>
+    <span class="g">
+      <input id="sn_outdent" type="checkbox"> Outdent sense numbers
+      <input id="sn_size" type="number" step="0.5" min="0" style="width:40px">
+      × step <span id="sn_hint" class="hint"></span>
+    </span>
+    <button id="resetAllBtn">Reset all to defaults</button>
+    <button id="copyCssBtn">Copy generated CSS</button>
+    <button id="copyAppDefBtn" title="The &lt;styles type=&quot;single-entry&quot;&gt; block, ready to splice into a copy of the appDef">Copy .appDef styles</button>
+    <button id="saveAppDefBtn" disabled title="Writes straight into the LIVE appDef (Chrome/Edge only). A one-time backup of its pre-tuning content is made automatically the first time.">Save to live appDef</button>
+    <span id="copyStatus" class="hint"></span>
+  </div>
+  <main>
+    <div id="previewPane">
+      <h2>Preview <span id="previewWidthLabel" class="hint"></span></h2>
+      <iframe id="previewFrame"></iframe>
+    </div>
+    <div id="dragDivider" title="Drag to resize the preview width"></div>
+    <div id="fieldsPane">
+      <h2>Fields</h2>
+      <table id="fieldsTable">
+        <thead><tr><th>Field</th><th>New line</th><th>Indent</th><th>Wrap indent</th><th>Space before</th><th></th></tr></thead>
+        <tbody id="fieldRows"></tbody>
+      </table>
+      <div id="rulesPane">
+        <h2>Generated rules</h2>
+        <div id="banner"></div>
+        <p id="tableHint">Click any text in the preview to filter this list to the rules that apply to it.
+          <a id="clearHighlightLink" style="display:none">Clear selection</a></p>
+        <table>
+          <thead><tr><th>Selector</th><th>Applied</th><th>Declarations</th></tr></thead>
+          <tbody id="rulesBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+</div>
+<script>
+// ==================== project data + loading ====================
+const DATA = {imported: [], entries: []};
+let importedNames = new Set();
+// currentProject shapes:
+//   {mode:"fsa", dirHandle, appDefHandle, appDefName, baseName, xhtmlName}  -- can Save
+//   {mode:"fallback", baseName, xhtmlName}                                  -- Copy only
+let currentProject = null;
+
+const ENTRY_CLASSES = new Set(["entry", "minorentryvariant", "minorentrycomplex"]);
+
+function parseStylesBlock(appDefText, openTag){
+  const start = appDefText.indexOf(openTag);
+  if (start === -1) return null;
+  const end = appDefText.indexOf("</styles>", start);
+  if (end === -1) return null;
+  const blockXml = appDefText.slice(start, end + "</styles>".length);
+  const doc = new DOMParser().parseFromString(blockXml, "application/xml");
+  if (doc.querySelector("parsererror")) return null;
+  const styles = [];
+  for (const el of Array.from(doc.documentElement.children)){
+    if (el.tagName !== "style") continue;
+    const name = el.getAttribute("name");
+    const decls = Array.from(el.children)
+      .filter(d => d.tagName === "style-decl")
+      .map(d => [d.getAttribute("property"), d.getAttribute("value")]);
+    styles.push({name, decls});
+  }
+  return styles;
+}
+
+function decodeHtmlEntities(s){
+  const ta = document.createElement("textarea");
+  ta.innerHTML = s;
+  return ta.value;
+}
+
+function parseEntries(xhtmlText){
+  const bodyStart = xhtmlText.indexOf("<body>");
+  const bodyEnd = xhtmlText.indexOf("</body>");
+  if (bodyStart === -1 || bodyEnd === -1) return [];
+  const body = xhtmlText.slice(bodyStart + "<body>".length, bodyEnd);
+  // Split on every div open tag, not just ones matching a fixed attribute order --
+  // some FLEx export configurations insert extra attributes (e.g. nodeId="...")
+  // between class and id, and pinning the split to "<div class=\"" specifically
+  // would still be fine here since class always comes first, but the per-chunk
+  // attribute match below can't assume that, so neither does this.
+  const chunks = body.split(/(?=<div\b)/);
+  const entries = [];
+  for (const chunk of chunks){
+    const tag = chunk.match(/^<div\s+([^>]*)>/);
+    if (!tag) continue;
+    const attrs = tag[1];
+    // class and id are matched independently -- order and any attributes between
+    // them (nodeId, etc.) don't matter, only that both are present somewhere.
+    const classMatch = attrs.match(/class="([^"]*)"/);
+    const idMatch = attrs.match(/\bid="([^"]*)"/);
+    if (!classMatch || !idMatch) continue;
+    const classes = classMatch[1].split(/\s+/);
+    if (!classes.some(c => ENTRY_CLASSES.has(c))) continue;
+    const aMatch = chunk.match(/<a[^>]*>([\s\S]*?)<\/a>/);
+    let headword = aMatch ? aMatch[1].replace(/<[^>]+>/g, "") : "(no headword)";
+    headword = decodeHtmlEntities(headword).trim();
+    entries.push({id: idMatch[1], cls: classMatch[1], headword, html: chunk});
+  }
+  return entries;
+}
+
+const loaderMsgEl = document.getElementById("loaderMsg");
+const loaderStatusEl = document.getElementById("loaderStatus");
+const lexiconPickerEl = document.getElementById("lexiconPicker");
+const workspaceEl = document.getElementById("workspace");
+const projectMetaEl = document.getElementById("projectMeta");
+const countsMetaEl = document.getElementById("countsMeta");
+const saveAppDefBtn = document.getElementById("saveAppDefBtn");
+
+function setLoaderStatus(msg, isError){
+  loaderStatusEl.textContent = msg || "";
+  loaderStatusEl.style.color = isError ? "#e0a83e" : "#8a8f98";
+}
+
+function showLexiconPicker(names, onChoose){
+  const select = document.getElementById("lexiconSelect");
+  select.innerHTML = "";
+  for (const n of names){
+    const opt = document.createElement("option");
+    opt.value = n; opt.textContent = n;
+    select.appendChild(opt);
+  }
+  lexiconPickerEl.classList.remove("hidden");
+  document.getElementById("lexiconChooseBtn").onclick = () => {
+    lexiconPickerEl.classList.add("hidden");
+    onChoose(select.value);
+  };
+  setLoaderStatus(`Found ${names.length} exported dictionaries above — choose one.`);
+}
+
+// The seam every loading path (File System Access, the plain-<input> fallback,
+// and manual testing) funnels through once it has parsed data in hand.
+function loadProjectData(imported, entries, meta){
+  DATA.imported = imported;
+  DATA.entries = entries;
+  importedNames = new Set(imported.map(s => s.name));
+
+  entrySelect.innerHTML = "";
+  entries.forEach((e, i) => {
+    const opt = document.createElement("option");
+    opt.value = i;
+    opt.textContent = e.headword + (e.cls !== "entry" ? "  (" + e.cls + ")" : "");
+    entrySelect.appendChild(opt);
+  });
+  // Prefer a structurally rich entry when this happens to be the Baraïn
+  // fixture (multiple senses, an example, a subentry) so every field control
+  // has something visible to affect; any other project just starts at 0.
+  const preferredIndex = entries.findIndex(e => e.headword === "aka");
+  entrySelect.value = preferredIndex >= 0 ? preferredIndex : 0;
+
+  countsMetaEl.textContent = `${entries.length} entries · ${imported.length} imported styles`;
+  projectMetaEl.textContent = meta ? [meta.projectName, meta.xhtmlName].filter(Boolean).join(" — ") : "";
+
+  loaderMsgEl.classList.add("hidden");
+  lexiconPickerEl.classList.add("hidden");
+  workspaceEl.classList.remove("hidden");
+  saveAppDefBtn.disabled = !(currentProject && currentProject.mode === "fsa");
+
+  renderPreview();
+}
+
+function finishLoad(appDefText, xhtmlText, xhtmlName){
+  const imported = parseStylesBlock(appDefText, "<styles>");
+  if (!imported){
+    setLoaderStatus(`Could not find an imported <styles> block in the appDef.`, true);
+    return;
+  }
+  const entries = parseEntries(xhtmlText);
+  if (!entries.length){
+    setLoaderStatus(`Parsed "${xhtmlName}" but found no entry/minorentryvariant/minorentrycomplex divs in it.`, true);
+    return;
+  }
+  if (currentProject) currentProject.xhtmlName = xhtmlName;
+  loadProjectData(imported, entries, {
+    projectName: currentProject ? currentProject.baseName : xhtmlName,
+    xhtmlName,
+  });
+}
+
+// ---- File System Access API path (Chrome/Edge): can read AND write back ----
+async function loadFromDirectoryHandle(dirHandle){
+  setLoaderStatus(`Scanning "${dirHandle.name}"…`);
+  let appDefHandle = null, appDefName = null;
+  for await (const [name, handle] of dirHandle.entries()){
+    if (handle.kind === "file" && /\.appdef$/i.test(name)){ appDefHandle = handle; appDefName = name; break; }
+  }
+  if (!appDefHandle){
+    setLoaderStatus(`No .appDef file found directly inside "${dirHandle.name}". Choose the project's top-level folder — the one that directly contains the .appDef file.`, true);
+    return;
+  }
+  const baseName = appDefName.replace(/\.appdef$/i, "");
+
+  let dataHandle = null;
+  try {
+    dataHandle = await dirHandle.getDirectoryHandle(baseName + "_data");
+  } catch (e){
+    const candidates = [];
+    for await (const [name, handle] of dirHandle.entries()){
+      if (handle.kind === "directory" && /_data$/i.test(name)) candidates.push(handle);
+    }
+    if (candidates.length === 1) dataHandle = candidates[0];
+  }
+  if (!dataHandle){
+    setLoaderStatus(`Found "${appDefName}" but no matching "<name>_data" folder next to it.`, true);
+    return;
+  }
+
+  let lexiconHandle;
+  try {
+    lexiconHandle = await dataHandle.getDirectoryHandle("lexicon");
+  } catch (e){
+    setLoaderStatus(`No "lexicon" folder found inside "${dataHandle.name}".`, true);
+    return;
+  }
+
+  const xhtmlCandidates = [];
+  let liftFound = false;
+  for await (const [name, handle] of lexiconHandle.entries()){
+    if (handle.kind !== "file") continue;
+    if (/\.xhtml$/i.test(name)) xhtmlCandidates.push({name, handle});
+    if (/\.lift$/i.test(name)) liftFound = true;
+  }
+  if (!xhtmlCandidates.length){
+    setLoaderStatus(liftFound
+      ? `"${dirHandle.name}" looks like a LIFT-based project (found a .lift file) — this tool only supports FLEx XHTML exports.`
+      : `No .xhtml file found in "${lexiconHandle.name}".`, true);
+    return;
+  }
+
+  currentProject = {mode: "fsa", dirHandle, appDefHandle, appDefName, baseName};
+
+  async function loadChosen(candidate){
+    setLoaderStatus(`Loading "${candidate.name}"…`);
+    try {
+      const appDefFile = await currentProject.appDefHandle.getFile();
+      const appDefText = await appDefFile.text();
+      const xhtmlFile = await candidate.handle.getFile();
+      const xhtmlText = await xhtmlFile.text();
+      finishLoad(appDefText, xhtmlText, candidate.name);
+    } catch (e){
+      setLoaderStatus(`Error reading project files: ${e.message}`, true);
+    }
+  }
+
+  if (xhtmlCandidates.length === 1){
+    await loadChosen(xhtmlCandidates[0]);
+  } else {
+    showLexiconPicker(xhtmlCandidates.map(c => c.name), (name) => {
+      loadChosen(xhtmlCandidates.find(c => c.name === name));
+    });
+  }
+}
+
+const chooseFolderBtn = document.getElementById("chooseFolderBtn");
+const folderInputFallback = document.getElementById("folderInputFallback");
+
+if (window.showDirectoryPicker){
+  chooseFolderBtn.addEventListener("click", async () => {
+    let dirHandle;
+    try {
+      // There's no way to hand the picker an arbitrary absolute starting path
+      // (browsers only allow a fixed well-known folder or a remembered
+      // picker) -- but a stable id makes Chrome remember the last folder
+      // *this specific picker* browsed to, across sessions. The first ever
+      // use starts in Documents (the closest well-known folder to
+      // .../Documents/App Builder/Dictionary Apps/App Projects); after that,
+      // it reopens wherever this picker last left off, which in practice is
+      // the App Projects folder once you've picked one project from it.
+      dirHandle = await window.showDirectoryPicker({id: "dab-project-folder", startIn: "documents"});
+    } catch (e){
+      return; // user cancelled the picker
+    }
+    await loadFromDirectoryHandle(dirHandle);
+  });
+} else {
+  // ---- Fallback for Firefox/Safari: read-only via a plain folder <input> ----
+  chooseFolderBtn.title = "This browser lacks the File System Access API — loading works, but Save must be done via Copy .appDef styles instead.";
+  chooseFolderBtn.addEventListener("click", () => folderInputFallback.click());
+  folderInputFallback.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    setLoaderStatus("Scanning folder…");
+    const appDefFile = files.find(f => {
+      const parts = f.webkitRelativePath.split("/");
+      return parts.length === 2 && /\.appdef$/i.test(parts[1]);
+    });
+    if (!appDefFile){
+      setLoaderStatus(`No .appDef file found directly inside the chosen folder.`, true);
+      return;
+    }
+    const baseName = appDefFile.name.replace(/\.appdef$/i, "");
+    const xhtmlFiles = files.filter(f => /\/lexicon\/[^/]+\.xhtml$/i.test(f.webkitRelativePath));
+    const liftFiles = files.filter(f => /\/lexicon\/[^/]+\.lift$/i.test(f.webkitRelativePath));
+    if (!xhtmlFiles.length){
+      setLoaderStatus(liftFiles.length
+        ? `This looks like a LIFT-based project — this tool only supports FLEx XHTML exports.`
+        : `No .xhtml file found in a "lexicon" folder inside the chosen project.`, true);
+      return;
+    }
+    currentProject = {mode: "fallback", baseName};
+    const appDefText = await appDefFile.text();
+    if (xhtmlFiles.length === 1){
+      finishLoad(appDefText, await xhtmlFiles[0].text(), xhtmlFiles[0].name);
+    } else {
+      showLexiconPicker(xhtmlFiles.map(f => f.name), async (name) => {
+        const chosen = xhtmlFiles.find(f => f.name === name);
+        finishLoad(appDefText, await chosen.text(), name);
+      });
+    }
+  });
+}
+
+// ==================== field/rule model (project-independent) ====================
+// Field/selector grouping taken from CLAUDE.md's geometry table and
+// "DAB styles to enter.md"'s 27 rows. Defaults reproduce that rule set exactly.
+//
+// Indent is a field's first-line position, in steps from the parent's edge --
+// what you'd actually measure on screen. Wrap indent is how much FURTHER IN,
+// beyond Indent, wrapped (2nd+) lines sit -- so 0 means wrapped lines land at
+// the same position as line 1, and it can't be negative (line 1 can never start
+// to the right of its own wrapped lines). margin-left/text-indent (what CSS
+// actually needs) are derived: margin-left = (indent+wrapIndent)*step,
+// text-indent = -wrapIndent*step.
+// Headword is not in this list -- its position is a fixed assumption (see
+// buildRules): always the start of the first line, wrapped lines one step in.
+const FIELD_DEFS = [
+  { key:"pos", label:"Part of speech", selectors:[".sharedgrammaticalinfo"],
+    ownLineDefault:true, indentDefault:0, wrapIndentDefault:0, gapDefault:0 },
+  { key:"definition", label:"Definition",
+    // The imported stylesheet has ".entry .senses > .sensecontent + .sensecontent"
+    // (FLEx's own print hanging-indent rule, matching every sense AFTER the
+    // first via the adjacent-sibling combinator) still carrying its own
+    // display/margin-left/text-indent. A Modification only overrides the exact
+    // selector it matches -- it doesn't win against a different, unmodified,
+    // more-specific selector in the normal CSS cascade -- so without this
+    // second row, sense 2+ keeps FLEx's original print indent while sense 1
+    // (which that sibling selector can never match) gets ours. Both rows need
+    // identical declarations.
+    selectors:[".sensecontent", ".entry .senses > .sensecontent + .sensecontent"],
+    ownLineDefault:true, indentDefault:2, wrapIndentDefault:1, gapDefault:0.5 },
+  { key:"example", label:"Example + translation", selectors:[".examplescontent"],
+    ownLineDefault:true, indentDefault:0, wrapIndentDefault:1, gapDefault:0.2,
+    always:[
+      {name:".entry .senses .examplescontents:before", decls:[["content","''"]]},
+      {name:".entry .senses .examplescontents> .examplescontent + .examplescontent:before", decls:[["content","''"]]},
+      {name:".entry .subentries .senses-2 .examplescontents-2:before", decls:[["content","''"]]},
+      {name:".entry .subentries .senses-2 .examplescontents-2> .examplescontent + .examplescontent:before", decls:[["content","''"]]}
+    ] },
+  { key:"translation", label:"Free translation", selectors:[".translationcontent"],
+    ownLineDefault:false, indentDefault:0, wrapIndentDefault:1, gapDefault:0 },
+  { key:"scientificname", label:"Scientific name", selectors:[".scientificname",".scientificname-2"],
+    ownLineDefault:true, indentDefault:0, wrapIndentDefault:1, gapDefault:0 },
+  { key:"semanticdomains", label:"Semantic domains", selectors:[".semanticdomains"],
+    ownLineDefault:true, indentDefault:0, wrapIndentDefault:1, gapDefault:0.2 },
+  { key:"backrefs", label:"Variant / cross-ref line",
+    selectors:[".variantformentrybackrefs",".visiblevariantentryrefs",".complexformentryrefs"],
+    ownLineDefault:true, indentDefault:0, wrapIndentDefault:1, gapDefault:0 },
+  { key:"subentries", label:"Subentry spacing", container:".subentries",
+    selectors:[".entry .subentries .subentry"],
+    ownLineDefault:true, indentDefault:1, wrapIndentDefault:0, gapDefault:0.5 },
+  { key:"complexformlist", label:"Complex-form list (minor entry)",
+    container:".visiblecomplexformbackrefs",
+    selectors:[".minorentryvariant .visiblecomplexformbackrefs .visiblecomplexformbackref"],
+    ownLineDefault:true, indentDefault:1, wrapIndentDefault:0, gapDefault:0.5 },
+  { key:"minorgloss", label:"Minor-entry gloss", selectors:[".definitionorglosses"],
+    ownLineDefault:true, indentDefault:2, wrapIndentDefault:1, gapDefault:0 },
+];
+
+const DEFAULT_GLOBALS = {step:0.6, lineHeight:1.35, edgePadding:0.3};
+let globals = {...DEFAULT_GLOBALS};
+
+// Outdent size is a magnitude (steps to hang left of wherever the definition
+// text would otherwise start), not a target position -- it doesn't track
+// Definition's own Indent, so changing Definition's Indent later will shift
+// where the number lands unless the outdent size is adjusted too.
+const DEFAULT_SENSE_NUMBER = {outdent:true, size:2};
+let senseNumberState = {...DEFAULT_SENSE_NUMBER};
+
+function defaultFieldState(f){
+  return {
+    on: f.ownLineDefault,
+    indent: f.indentDefault || 0,
+    wrapIndent: f.wrapIndentDefault || 0,
+    gap: f.gapDefault || 0,
+  };
+}
+let fstates = {};
+for (const f of FIELD_DEFS) fstates[f.key] = defaultFieldState(f);
+const DEFAULT_FSTATES = JSON.parse(JSON.stringify(fstates));
+
+function em(n){ return (Math.round(n*1000)/1000) + "em"; }
+
+function buildRules(){
+  const rules = [];
+  for (const sel of [".entry",".minorentryvariant",".minorentrycomplex"]){
+    rules.push({name:sel, decls:[
+      ["margin-left","0"],["text-indent","0"],
+      ["padding-left",em(globals.edgePadding)],["padding-right",em(globals.edgePadding)],
+      ["line-height", String(globals.lineHeight)],["white-space","normal"]
+    ]});
+  }
+  // .senses (main entry) and .senses-2 (subentry) are the containers around the
+  // whole part-of-speech + sense list, not a tunable field themselves -- they only
+  // need to be block so the group starts its own line, and must stay at
+  // margin-left:0 always. Both must get this fixed rule, or unchecking Part of
+  // speech's "New line" behaves differently in the two contexts: with only
+  // .senses forced block, turning off .sharedgrammaticalinfo's own display:block
+  // still leaves it inside an already-block .senses in the main entry (no visible
+  // change), while the subentry -- with no equivalent .senses-2 rule -- loses its
+  // only source of the line break and merges up onto the headword's line.
+  rules.push({name:".senses", decls:[["display","block"],["margin-left","0"],["text-indent","0"]]});
+  rules.push({name:".senses-2", decls:[["display","block"],["margin-left","0"],["text-indent","0"]]});
+
+  // Headword position is a fixed assumption, not a user control: always the start
+  // of the first line, with wrapped lines indented one step further in.
+  const headwordMargin = 1 * globals.step;
+  const headwordTextIndent = -1 * globals.step;
+  for (const sel of [".mainheadword",".headword",".headword-5"]){
+    rules.push({name:sel, decls:[
+      ["display","block"],["margin-left", em(headwordMargin)],["text-indent", em(headwordTextIndent)],
+      ["font-size","120%"],["padding-bottom","0.15em"]
+    ]});
+  }
+
+  // Sense numbers are inline content at the very start of .sensecontent, so an
+  // outdent is just a negative margin-left of that size, paired with a min-width
+  // of the same size so the definition text resumes where it normally would.
+  if (senseNumberState.outdent){
+    const widthEm = em(Math.max(0, senseNumberState.size) * globals.step);
+    rules.push({name:".sensenumber", decls:[
+      ["display","inline-block"],["min-width", widthEm],["margin-left", "-" + widthEm],["text-indent","0"]
+    ]});
+  }
+
+  for (const f of FIELD_DEFS){
+    const fs = fstates[f.key];
+    if (f.container){
+      rules.push({name:f.container, decls:[
+        ["display","block"],["margin-left","0"],["text-indent","0"],["padding-top", em(fs.gap)]
+      ]});
+    }
+    if (fs.on){
+      const marginLeft = (fs.indent + fs.wrapIndent) * globals.step;
+      const textIndent = -fs.wrapIndent * globals.step;
+      const decls = [
+        ["display","block"],
+        ["margin-left", em(marginLeft)],
+        ["text-indent", em(textIndent)],
+        ["padding-top", em(fs.gap)],
+      ];
+      if (f.extraDecls) decls.push(...f.extraDecls);
+      for (const sel of f.selectors) rules.push({name: sel, decls});
+    }
+    if (f.always) rules.push(...f.always);
+  }
+  return rules;
+}
+
+// ==================== UI wiring (all project-independent) ====================
+const entrySelect = document.getElementById("entrySelect");
+const findBox = document.getElementById("findBox");
+const previewFrame = document.getElementById("previewFrame");
+const rulesBody = document.getElementById("rulesBody");
+const banner = document.getElementById("banner");
+const clearHighlightLink = document.getElementById("clearHighlightLink");
+let lastClickedEl = null;
+
+// --- draggable preview width (test how text wraps at different widths) ---
+const previewPane = document.getElementById("previewPane");
+const dragDivider = document.getElementById("dragDivider");
+const previewWidthLabel = document.getElementById("previewWidthLabel");
+const MIN_PREVIEW_WIDTH = 200;
+const MAX_PREVIEW_WIDTH = 900;
+
+function setPreviewWidth(px){
+  const clamped = Math.max(MIN_PREVIEW_WIDTH, Math.min(MAX_PREVIEW_WIDTH, Math.round(px)));
+  previewPane.style.width = clamped + "px";
+  previewWidthLabel.textContent = clamped + "px";
+}
+setPreviewWidth(parseInt(getComputedStyle(previewPane).width, 10));
+
+let draggingPreview = false;
+dragDivider.addEventListener("mousedown", (e) => {
+  draggingPreview = true;
+  dragDivider.classList.add("dragging");
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+  // Dragging left sweeps the cursor over the iframe, which is a separate
+  // document -- without this, its own event handling swallows the mousemove
+  // before it reaches this page's window listener, so the drag stalls the
+  // moment the cursor crosses into it (dragging right never hits this, since
+  // it sweeps over plain page content instead).
+  previewFrame.style.pointerEvents = "none";
+  e.preventDefault();
+});
+window.addEventListener("mousemove", (e) => {
+  if (!draggingPreview) return;
+  const rect = previewPane.getBoundingClientRect();
+  setPreviewWidth(e.clientX - rect.left);
+});
+window.addEventListener("mouseup", () => {
+  if (!draggingPreview) return;
+  draggingPreview = false;
+  dragDivider.classList.remove("dragging");
+  previewFrame.style.pointerEvents = "";
+  document.body.style.cursor = "";
+  document.body.style.userSelect = "";
+});
+
+function currentIndex(){ return parseInt(entrySelect.value || "0", 10); }
+function selectIndex(i){
+  if (i < 0 || i >= DATA.entries.length) return;
+  entrySelect.value = i;
+  renderPreview();
+}
+document.getElementById("prevBtn").onclick = () => selectIndex(currentIndex() - 1);
+document.getElementById("nextBtn").onclick = () => selectIndex(currentIndex() + 1);
+entrySelect.onchange = renderPreview;
+findBox.addEventListener("input", () => {
+  const q = findBox.value.trim().toLowerCase();
+  if (!q) return;
+  const idx = DATA.entries.findIndex(e => e.headword.toLowerCase().startsWith(q));
+  if (idx >= 0) selectIndex(idx);
+});
+
+// --- globals bar ---
+const globalInputs = {
+  step: document.getElementById("g_step"),
+  lineHeight: document.getElementById("g_lineHeight"),
+  edgePadding: document.getElementById("g_edgePadding"),
+};
+function syncGlobalInputs(){
+  for (const k in globalInputs) globalInputs[k].value = globals[k];
+}
+syncGlobalInputs();
+for (const k in globalInputs){
+  globalInputs[k].addEventListener("input", () => {
+    const v = parseFloat(globalInputs[k].value);
+    globals[k] = isNaN(v) ? 0 : v;
+    updateAllHints();
+    renderPreview();
+  });
+}
+
+// --- sense number outdent ---
+const snOutdent = document.getElementById("sn_outdent");
+const snSize = document.getElementById("sn_size");
+const snHint = document.getElementById("sn_hint");
+function syncSenseNumberInputs(){
+  snOutdent.checked = senseNumberState.outdent;
+  snSize.value = senseNumberState.size;
+  snSize.disabled = !senseNumberState.outdent;
+  updateSenseNumberHint();
+}
+function updateSenseNumberHint(){
+  snHint.textContent = "= " + em(Math.max(0, senseNumberState.size) * globals.step);
+}
+snOutdent.addEventListener("change", () => {
+  senseNumberState.outdent = snOutdent.checked;
+  snSize.disabled = !senseNumberState.outdent;
+  renderPreview();
+});
+snSize.addEventListener("input", () => {
+  senseNumberState.size = Math.max(0, parseFloat(snSize.value) || 0);
+  updateSenseNumberHint();
+  renderPreview();
+});
+syncSenseNumberInputs();
+
+document.getElementById("resetAllBtn").onclick = () => {
+  globals = {...DEFAULT_GLOBALS};
+  senseNumberState = {...DEFAULT_SENSE_NUMBER};
+  fstates = JSON.parse(JSON.stringify(DEFAULT_FSTATES));
+  syncGlobalInputs();
+  syncSenseNumberInputs();
+  syncFieldInputs();
+  renderPreview();
+};
+const copyStatus = document.getElementById("copyStatus");
+function flashStatus(msg, isError){
+  copyStatus.textContent = msg;
+  copyStatus.style.color = isError ? "#e0a83e" : "#8a8f98";
+  clearTimeout(flashStatus._t);
+  flashStatus._t = setTimeout(() => { copyStatus.textContent = ""; }, 6000);
+}
+
+document.getElementById("copyCssBtn").onclick = () => {
+  const rules = buildRules();
+  const text = rules.map(r => `${r.name} {\n` +
+    r.decls.map(([p,v]) => `  ${p}: ${v};`).join("\n") + `\n}`).join("\n\n");
+  navigator.clipboard.writeText(text);
+  flashStatus(`Copied ${rules.length} CSS rules.`);
+};
+
+// Escaping matches what DAB itself writes in an appDef's <styles> blocks (see a
+// project's own single-entry section for reference): & first so it doesn't
+// double-escape the entities this then inserts, then the rest.
+function escapeAppDefAttr(s){
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/'/g, "&apos;")
+    .replace(/"/g, "&quot;");
+}
+
+function buildAppDefXml(rules, eol){
+  eol = eol || "\n";
+  const lines = ['  <styles type="single-entry">'];
+  for (const r of rules){
+    lines.push(`    <style name="${escapeAppDefAttr(r.name)}" category="text">`);
+    for (const [prop, val] of r.decls){
+      lines.push(`      <style-decl property="${escapeAppDefAttr(prop)}" value="${escapeAppDefAttr(val)}"/>`);
+    }
+    lines.push(`    </style>`);
+  }
+  lines.push('  </styles>');
+  return lines.join(eol);
+}
+
+function unresolvedRules(rules){
+  return rules.filter(r => !importedNames.has(r.name));
+}
+
+document.getElementById("copyAppDefBtn").onclick = () => {
+  const rules = buildRules();
+  // Every selector here is one of the fixed fields/roles this tool knows about,
+  // already checked once against this project's Imported Styles list -- but
+  // check again here rather than trust that, per CLAUDE.md's rule: a Modification
+  // row DAB can't match against the Imported list is silently discarded, not
+  // rejected, so this is the only place that would ever catch a regression.
+  const unresolved = unresolvedRules(rules);
+  if (unresolved.length){
+    flashStatus(`Not copied: ${unresolved.length} selector(s) aren't on the Imported Styles list (see the red rows below).`, true);
+    return;
+  }
+  navigator.clipboard.writeText(buildAppDefXml(rules));
+  flashStatus(`Copied the <styles type="single-entry"> block (${rules.length} rules). Splice it into a COPY of the appDef, and confirm modify-single-entry-styles is "true".`);
+};
+
+function detectEOL(text){
+  return text.includes("\r\n") ? "\r\n" : "\n";
+}
+
+// Only safety net left once Save writes the live appDef directly: capture its
+// pre-tuning content once, the first time this project is saved, and never
+// touch that backup again afterward -- so it always reflects "before
+// dab-entry-formatter ever touched this file," not just "before the last save."
+async function ensureBackup(dirHandle, baseName, currentText){
+  const backupName = baseName + " (backup before dab-entry-formatter).appDef";
+  try {
+    await dirHandle.getFileHandle(backupName, {create: false});
+    return backupName; // already exists from an earlier session -- leave it alone
+  } catch (e){
+    const backupHandle = await dirHandle.getFileHandle(backupName, {create: true});
+    const w = await backupHandle.createWritable();
+    await w.write(currentText);
+    await w.close();
+    return backupName;
+  }
+}
+
+saveAppDefBtn.addEventListener("click", async () => {
+  if (!currentProject || currentProject.mode !== "fsa") return;
+  const rules = buildRules();
+  const unresolved = unresolvedRules(rules);
+  if (unresolved.length){
+    flashStatus(`Not saved: ${unresolved.length} selector(s) aren't on the Imported Styles list.`, true);
+    return;
+  }
+  try {
+    const appDefFile = await currentProject.appDefHandle.getFile();
+    const appDefText = await appDefFile.text();
+    const eol = detectEOL(appDefText);
+
+    const openTag = '<styles type="single-entry">';
+    const closeTag = "</styles>";
+    let newText = null;
+
+    const openIdx = appDefText.indexOf(openTag);
+    if (openIdx !== -1){
+      const closeIdx = appDefText.indexOf(closeTag, openIdx);
+      if (closeIdx === -1){
+        flashStatus(`Found "${openTag}" but no matching "${closeTag}" — refusing to guess. Not saved.`, true);
+        return;
+      }
+      const before = appDefText.slice(0, openIdx);
+      const after = appDefText.slice(closeIdx + closeTag.length);
+      newText = before + buildAppDefXml(rules, eol) + after;
+      // Byte-splice sanity check, per CLAUDE.md: everything outside the
+      // replaced block must come through completely untouched.
+      if (!newText.startsWith(before) || !newText.endsWith(after)){
+        flashStatus("Internal error: prefix/suffix check failed. Not saved.", true);
+        return;
+      }
+    } else {
+      const selfMatch = appDefText.match(/<styles\s+type="single-entry"\s*\/>/);
+      if (selfMatch){
+        const before = appDefText.slice(0, selfMatch.index);
+        const after = appDefText.slice(selfMatch.index + selfMatch[0].length);
+        newText = before + buildAppDefXml(rules, eol) + after;
+      } else {
+        flashStatus(`Could not find a <styles type="single-entry"> block in "${currentProject.appDefName}" to replace. Open the project in DAB once, turn on "Modify Single-Entry Styles", save, and try again.`, true);
+        return;
+      }
+    }
+
+    // Turn the feature on if it's currently off; leave alone if already on or
+    // in some other form we don't recognise (never invent structure here).
+    newText = newText.replace(
+      /(<feature name="modify-single-entry-styles" value=")false("\s*\/>)/,
+      "$1true$2"
+    );
+
+    const backupName = await ensureBackup(currentProject.dirHandle, currentProject.baseName, appDefText);
+
+    const writable = await currentProject.appDefHandle.createWritable();
+    await writable.write(newText);
+    await writable.close();
+
+    flashStatus(`Saved directly to "${currentProject.appDefName}" (${rules.length} rules). Pre-tuning content is backed up in "${backupName}". Close and reopen DAB to see the change.`);
+  } catch (e){
+    flashStatus(`Save failed: ${e.message}`, true);
+  }
+});
+
+// --- fields table ---
+// Every field has the same four controls now: On new line, Indent, Wrap indent,
+// Space before. No per-row branching on which controls exist.
+const fieldRows = document.getElementById("fieldRows");
+const rowInputs = {};
+
+function numberCell(value, unit, onChange){
+  const td = document.createElement("td");
+  td.className = "ctl";
+  const inp = document.createElement("input");
+  inp.type = "number"; inp.step = "0.5"; inp.min = "0"; inp.value = value;
+  const hint = document.createElement("span");
+  hint.className = "hint";
+  inp.addEventListener("input", () => onChange(parseFloat(inp.value) || 0, hint));
+  td.appendChild(inp);
+  if (unit) td.appendChild(document.createTextNode(" × " + unit + " "));
+  td.appendChild(hint);
+  return {td, input: inp, hint};
+}
+
+for (const f of FIELD_DEFS){
+  const fs = fstates[f.key];
+  const tr = document.createElement("tr");
+  const cells = {};
+
+  const nameTd = document.createElement("td");
+  nameTd.className = "fieldname";
+  nameTd.textContent = f.label;
+  tr.appendChild(nameTd);
+
+  const onTd = document.createElement("td");
+  onTd.className = "ctl";
+  const cb = document.createElement("input");
+  cb.type = "checkbox";
+  cb.checked = fs.on;
+  cb.addEventListener("change", () => { fs.on = cb.checked; updateRowDisabled(f.key); renderPreview(); });
+  onTd.appendChild(cb);
+  cells.on = cb;
+  tr.appendChild(onTd);
+
+  const indent = numberCell(fs.indent, "step", (v, hint) => {
+    fs.indent = v;
+    updateHint(hint, v, globals.step);
+    renderPreview();
+  });
+  tr.appendChild(indent.td);
+  cells.indent = indent.input; cells.indentHint = indent.hint;
+
+  const wrapIndent = numberCell(fs.wrapIndent, "step", (v, hint) => {
+    fs.wrapIndent = Math.max(0, v);
+    updateHint(hint, fs.wrapIndent, globals.step, "+");
+    renderPreview();
+  });
+  wrapIndent.td.title = "How much further in, beyond Indent, wrapped (2nd+) lines sit. 0 = wraps to the same position as line 1.";
+  tr.appendChild(wrapIndent.td);
+  cells.wrapIndent = wrapIndent.input; cells.wrapIndentHint = wrapIndent.hint;
+
+  const gapTd = document.createElement("td");
+  gapTd.className = "ctl";
+  const gapInp = document.createElement("input");
+  gapInp.type = "number"; gapInp.step = "0.1"; gapInp.min = "0"; gapInp.value = fs.gap;
+  gapInp.addEventListener("input", () => { fs.gap = parseFloat(gapInp.value) || 0; renderPreview(); });
+  gapTd.appendChild(gapInp);
+  gapTd.appendChild(document.createTextNode(" em"));
+  cells.gap = gapInp;
+  tr.appendChild(gapTd);
+
+  const resetTd = document.createElement("td");
+  const resetBtn = document.createElement("button");
+  resetBtn.className = "rowreset";
+  resetBtn.title = "Reset this field to its default";
+  resetBtn.textContent = "↺";
+  resetBtn.onclick = () => {
+    fstates[f.key] = defaultFieldState(f);
+    syncFieldRow(f.key);
+    renderPreview();
+  };
+  resetTd.appendChild(resetBtn);
+  tr.appendChild(resetTd);
+
+  fieldRows.appendChild(tr);
+  rowInputs[f.key] = {tr, ...cells};
+  updateRowDisabled(f.key);
+  updateHint(cells.indentHint, fs.indent, globals.step);
+  updateHint(cells.wrapIndentHint, fs.wrapIndent, globals.step, "+");
+}
+
+function updateHint(el, multiplier, unit, prefix){
+  el.textContent = (prefix || "=") + " " + em(multiplier * unit);
+}
+
+function updateRowDisabled(key){
+  const fs = fstates[key];
+  const row = rowInputs[key];
+  const disabled = !fs.on;
+  row.tr.classList.toggle("disabledrow", disabled);
+  row.indent.disabled = disabled;
+  row.wrapIndent.disabled = disabled;
+  row.gap.disabled = disabled;
+}
+
+function syncFieldRow(key){
+  const fs = fstates[key];
+  const row = rowInputs[key];
+  row.on.checked = fs.on;
+  row.indent.value = fs.indent;
+  row.wrapIndent.value = fs.wrapIndent;
+  row.gap.value = fs.gap;
+  updateHint(row.indentHint, fs.indent, globals.step);
+  updateHint(row.wrapIndentHint, fs.wrapIndent, globals.step, "+");
+  updateRowDisabled(key);
+}
+function syncFieldInputs(){
+  for (const f of FIELD_DEFS) syncFieldRow(f.key);
+}
+function updateAllHints(){
+  for (const f of FIELD_DEFS){
+    const row = rowInputs[f.key];
+    const fs = fstates[f.key];
+    updateHint(row.indentHint, fs.indent, globals.step);
+    updateHint(row.wrapIndentHint, fs.wrapIndent, globals.step, "+");
+  }
+  updateSenseNumberHint();
+}
+
+// Hidden real DOM container used only to ask the browser "does this selector match
+// anything in this entry?" -- reuses the browser's own CSS engine instead of
+// reimplementing selector matching.
+const probe = document.createElement("div");
+probe.style.display = "none";
+document.body.appendChild(probe);
+
+function matchCount(container, selector){
+  try { return container.querySelectorAll(selector).length; } catch (e) { return 0; }
+}
+
+previewFrame.addEventListener("load", () => {
+  const doc = previewFrame.contentDocument;
+  if (!doc) return;
+  doc.body.addEventListener("click", onPreviewClick);
+});
+
+function onPreviewClick(e){
+  // Headword spans wrap real <a href="#guid"> links. A srcdoc iframe's base URL is
+  // inherited from the parent page, so a plain fragment click would navigate the
+  // whole tool inside the iframe rather than resolving locally -- never follow it.
+  e.preventDefault();
+  const doc = previewFrame.contentDocument;
+  if (e.target === doc.body) { clearHighlight(); return; }
+
+  if (lastClickedEl) lastClickedEl.style.outline = "";
+  lastClickedEl = e.target;
+  lastClickedEl.style.outline = "2px solid #5fa8ff";
+
+  const chain = [];
+  let node = e.target;
+  while (node && node.nodeType === 1 && node !== doc.body){
+    chain.push(node);
+    node = node.parentElement;
+  }
+
+  const rows = Array.from(rulesBody.querySelectorAll("tr"));
+  let firstMatch = null;
+  for (const tr of rows){
+    const stripped = tr.dataset.sel.replace(/::?(before|after)$/, "");
+    let matched = false;
+    for (const n of chain){
+      try { if (n.matches(stripped)) { matched = true; break; } } catch(_) {}
+    }
+    tr.classList.toggle("rowmatch", matched);
+    tr.classList.toggle("rowdim", !matched);
+    if (matched && !firstMatch) firstMatch = tr;
+  }
+  clearHighlightLink.style.display = "inline";
+  if (firstMatch) firstMatch.scrollIntoView({block: "nearest"});
+}
+
+function clearHighlight(){
+  rulesBody.querySelectorAll("tr").forEach(tr => tr.classList.remove("rowmatch", "rowdim"));
+  clearHighlightLink.style.display = "none";
+  if (lastClickedEl){ lastClickedEl.style.outline = ""; lastClickedEl = null; }
+}
+clearHighlightLink.onclick = clearHighlight;
+
+function declText(decls){
+  return decls.map(([p,v]) => `${p}: ${v};`).join(" ");
+}
+// !important on every declaration: per CLAUDE.md's "Modifications override
+// imported declarations regardless of CSS specificity" -- DAB merges a
+// Modification into the imported rule with that exact selector text and the
+// result wins outright, not just a same-selector tie broken by source order.
+// Without !important, an unrelated, more-specific *imported* rule (e.g. FLEx's
+// own ".senses > .sensecontent", two classes, vs our bare ".sensecontent", one
+// class -- the normal shape of FLEx-generated CSS) legitimately outranks ours
+// by ordinary cascade rules and the preview shows the untouched original
+// layout for anything only reachable through the lower-specificity selector,
+// even though DAB itself would apply the override. That's a materially
+// different (weaker) effect than DAB's real behaviour, so it's not a safe
+// default here.
+function cssBlock(rules){
+  return rules.map(r => {
+    const decls = r.decls.map(([p,v]) => `  ${p}: ${v} !important;`).join("\n");
+    return `${r.name} {\n${decls}\n}`;
+  }).join("\n");
+}
+
+function renderPreview(){
+  const entry = DATA.entries[currentIndex()];
+  if (!entry) return;
+  probe.innerHTML = entry.html;
+  lastClickedEl = null;
+  clearHighlightLink.style.display = "none";
+
+  const rules = buildRules();
+  const importedCss = DATA.imported.map(s =>
+    `${s.name} {\n` + s.decls.map(([p,v]) => `  ${p}: ${v};`).join("\n") + `\n}`
+  ).join("\n");
+  const generatedCss = cssBlock(rules);
+
+  previewFrame.srcdoc =
+    `<!doctype html><html><head><meta charset="utf-8"><style>
+      body{margin:8px;font:100%/1.3 "Charis","Segoe UI",serif;background:#f2f0ec;color:#111}
+      ${importedCss}
+      ${generatedCss}
+    </style></head><body>${entry.html}</body></html>`;
+
+  const applicable = rules.filter(r => matchCount(probe, r.name) > 0);
+  rulesBody.innerHTML = "";
+  const unresolved = [];
+  for (const r of applicable){
+    const tr = document.createElement("tr");
+    tr.dataset.sel = r.name;
+    const applied = importedNames.has(r.name);
+    if (!applied){
+      tr.classList.add("badrow");
+      unresolved.push(r);
+    }
+    const appliedCell = applied
+      ? `<span class="ok">&#10003; yes</span>`
+      : `<span class="bad">&#9888; no match</span>`;
+    tr.innerHTML =
+      `<td class="sel">${r.name.replace(/</g,"&lt;")}</td>` +
+      `<td>${appliedCell}</td>` +
+      `<td class="decl">${declText(r.decls).replace(/</g,"&lt;")}</td>`;
+    rulesBody.appendChild(tr);
+  }
+
+  if (unresolved.length){
+    banner.style.display = "block";
+    banner.innerHTML = `<b>${unresolved.length} generated rule${unresolved.length>1?"s":""} not on the Imported Styles list.</b>` +
+      `<ul>` + unresolved.map(r =>
+        `<li><code>${r.name.replace(/</g,"&lt;")}</code> &mdash; DAB would discard this Modification row.</li>`
+      ).join("") + `</ul>`;
+  } else {
+    banner.style.display = "none";
+  }
+}
+</script>
+</body></html>
+"""
+
+if __name__ == "__main__":
+    main()
