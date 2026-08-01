@@ -4,6 +4,8 @@ This tool allows you to tune single-entry formatting for a Dictionary App Builde
 FieldWorks (FLEx) XHTML export, without hand-writing CSS. See [DESIGN.md](DESIGN.md) for what
 it does and how; [CLAUDE.md](CLAUDE.md) for the DAB/FLEx facts it's built on.
 
+![DAB Entry Tuner: a live preview of an entry on the left and field-by-field indent/spacing controls on the right](screenshot.png)
+
 ## How to use it
 
 You only need one file: **[dab-entry-formatter.html](dab-entry-formatter.html)**. Download it
