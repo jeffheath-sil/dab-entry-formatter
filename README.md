@@ -28,7 +28,8 @@ and open it in **Chrome or Edge** (double-click it, or drag it into a browser wi
 6. When you're happy, click **Save to live appDef**. It writes straight into your project's live
    `.appDef` and turns on "Modify Single-Entry Styles" if it wasn't already. The first save for a
    project automatically backs up the pre-tuning appDef as
-   `<name> (backup before dab-entry-formatter).appDef`, so you always have a way back.
+   `<name> (before tuning).appDef.backup`, so you always have a way back — the `.backup`
+   extension keeps it from ever being mistaken for a live project file.
 7. Close and reopen the project in DAB to see the result.
 
 **Firefox and Safari** can load and tune a project too, but lack the browser API needed to save

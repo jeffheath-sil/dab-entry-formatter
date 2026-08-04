@@ -60,6 +60,11 @@
  tr.rowdim{opacity:.35}
  #tableHint{font-size:12px;color:#8a8f98;margin:0 0 8px}
  #tableHint a{color:#8fd0ff;cursor:pointer}
+ dialog#saveConfirmDialog{max-width:380px;border:1px solid #454952;border-radius:6px;
+   background:#202226;color:#e8e8e8;padding:16px 18px}
+ dialog#saveConfirmDialog::backdrop{background:rgba(0,0,0,.5)}
+ dialog#saveConfirmDialog p{margin:0;line-height:1.5}
+ dialog#saveConfirmDialog .actions{margin-top:14px;text-align:right}
 </style></head><body>
 <header>
   <h1>DAB Entry Tuner</h1>
@@ -71,7 +76,8 @@
   <p>Choose the DAB project folder to tune — the one that directly contains the project's
     <code>.appDef</code> file, e.g.
     <code>…\Documents\App Builder\Dictionary Apps\App Projects\&lt;Project Name&gt;</code>.</p>
-  <p>FLEx XHTML exports only (a LIFT-based project will be reported, not crashed on).</p>
+  <p>This tuner only works on DAB projects based on FLEx XHTML exports (a LIFT-based project
+    folder will be rejected).</p>
   <p id="loaderStatus" class="hint"></p>
 </div>
 <div id="lexiconPicker" class="panel hidden">
@@ -128,6 +134,10 @@
     </div>
   </main>
 </div>
+<dialog id="saveConfirmDialog">
+  <p id="saveConfirmMessage"></p>
+  <div class="actions"><button id="saveConfirmOkBtn">OK</button></div>
+</dialog>
 <script>
 // ==================== project data + loading ====================
 const DATA = {imported: [], entries: []};
@@ -276,6 +286,10 @@ function finishLoad(appDefText, xhtmlText, xhtmlName){
 
 // ---- File System Access API path (Chrome/Edge): can read AND write back ----
 async function loadFromDirectoryHandle(dirHandle){
+  // A lexicon picker left over from a previous, abandoned choice (user picked
+  // a folder with >1 .xhtml, then hit Choose again before answering it) is no
+  // longer relevant to this new folder -- drop it before scanning.
+  lexiconPickerEl.classList.add("hidden");
   setLoaderStatus(`Scanning "${dirHandle.name}"…`);
   let appDefHandle = null, appDefName = null;
   for await (const [name, handle] of dirHandle.entries()){
@@ -352,17 +366,21 @@ const chooseFolderBtn = document.getElementById("chooseFolderBtn");
 const folderInputFallback = document.getElementById("folderInputFallback");
 
 if (window.showDirectoryPicker){
+  // The picker itself is native OS chrome -- there's no API to set its title
+  // or preload an arbitrary path, so the closest we can do is tell the user
+  // where to navigate to via this button's own tooltip.
+  chooseFolderBtn.title = "Opens in Documents -- navigate to " +
+    "App Builder\\Dictionary Apps\\App Projects\\<Your Project>.";
   chooseFolderBtn.addEventListener("click", async () => {
     let dirHandle;
     try {
       // There's no way to hand the picker an arbitrary absolute starting path
-      // (browsers only allow a fixed well-known folder or a remembered
-      // picker) -- but a stable id makes Chrome remember the last folder
-      // *this specific picker* browsed to, across sessions. The first ever
-      // use starts in Documents (the closest well-known folder to
-      // .../Documents/App Builder/Dictionary Apps/App Projects); after that,
-      // it reopens wherever this picker last left off, which in practice is
-      // the App Projects folder once you've picked one project from it.
+      // (browsers only allow a fixed well-known folder, not an arbitrary one)
+      // -- the "id" option is documented to make Chrome remember the last
+      // folder browsed to under that id, but that didn't hold up in practice
+      // here (still reopens at Documents every time), so don't rely on or
+      // advertise it. startIn:"documents" is the closest well-known folder to
+      // .../Documents/App Builder/Dictionary Apps/App Projects.
       dirHandle = await window.showDirectoryPicker({id: "dab-project-folder", startIn: "documents"});
     } catch (e){
       return; // user cancelled the picker
@@ -376,6 +394,7 @@ if (window.showDirectoryPicker){
   folderInputFallback.addEventListener("change", async (e) => {
     const files = Array.from(e.target.files);
     if (!files.length) return;
+    lexiconPickerEl.classList.add("hidden");
     setLoaderStatus("Scanning folder…");
     const appDefFile = files.find(f => {
       const parts = f.webkitRelativePath.split("/");
@@ -673,6 +692,17 @@ document.getElementById("resetAllBtn").onclick = () => {
   syncFieldInputs();
   renderPreview();
 };
+const saveConfirmDialog = document.getElementById("saveConfirmDialog");
+const saveConfirmMessage = document.getElementById("saveConfirmMessage");
+document.getElementById("saveConfirmOkBtn").onclick = () => saveConfirmDialog.close();
+// Save's "close and reopen DAB" instruction is easy to miss as a transient
+// flashStatus toast -- it matters enough (skip it and the tuned entry looks
+// unchanged) that it needs an explicit OK click, not a timeout.
+function showSaveConfirmModal(msg){
+  saveConfirmMessage.textContent = msg;
+  saveConfirmDialog.showModal();
+}
+
 const copyStatus = document.getElementById("copyStatus");
 function flashStatus(msg, isError){
   copyStatus.textContent = msg;
@@ -743,8 +773,11 @@ function detectEOL(text){
 // pre-tuning content once, the first time this project is saved, and never
 // touch that backup again afterward -- so it always reflects "before
 // dab-entry-formatter ever touched this file," not just "before the last save."
+// The name ends in .appDef.backup, not .appDef -- DAB enumerates a folder for
+// *.appDef to list projects, so a real ".appDef" extension risks the backup
+// itself showing up as an openable (and editable) project.
 async function ensureBackup(dirHandle, baseName, currentText){
-  const backupName = baseName + " (backup before dab-entry-formatter).appDef";
+  const backupName = baseName + " (before tuning).appDef.backup";
   try {
     await dirHandle.getFileHandle(backupName, {create: false});
     return backupName; // already exists from an earlier session -- leave it alone
@@ -815,7 +848,7 @@ saveAppDefBtn.addEventListener("click", async () => {
     await writable.write(newText);
     await writable.close();
 
-    flashStatus(`Saved directly to "${currentProject.appDefName}" (${rules.length} rules). Pre-tuning content is backed up in "${backupName}". Close and reopen DAB to see the change.`);
+    showSaveConfirmModal(`Saved directly to "${currentProject.appDefName}" (${rules.length} rules). Pre-tuning content is backed up in "${backupName}". Close and reopen DAB to see the change.`);
   } catch (e){
     flashStatus(`Save failed: ${e.message}`, true);
   }

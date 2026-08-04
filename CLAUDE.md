@@ -126,7 +126,9 @@ path under the project directory if a screenshot write fails silently.
 `dab-entry-formatter.py`'s generated tool writes directly into the **live** appDef — a deliberate
 departure from "never touch the live file," made at the project owner's explicit request. The one
 safety net: the first Save for a project backs up its pre-tuning appDef once, as
-`<name> (backup before dab-entry-formatter).appDef`, and never overwrites that backup again.
+`<name> (before tuning).appDef.backup`, and never overwrites that backup again. The `.backup`
+extension (not `.appDef`) is deliberate — DAB lists a folder's `*.appDef` files as its projects, so
+a backup with a real `.appDef` extension risks being opened and edited as if it were live.
 
 - Replace only the `<styles type="single-entry">` block; byte-splice so everything else stays
   untouched. Assert the prefix and suffix are byte-identical afterward.
